@@ -49,7 +49,7 @@ jobs:
             deployments=$(curl --fail --silent --show-error \
               -H "x-api-key: $DOKPLOY_API_KEY" \
               "$DOKPLOY_URL/api/deployment.all?applicationId=$DOKPLOY_APPLICATION_ID")
-            status=$(jq -r --arg run "$run_url" '[.[] | select(.description == $run)][0].status // "pending"' <<<"$deployments")
+            status=$(jq -r --arg commit "Commit: $GITHUB_SHA" '[.[] | select(.description == $commit)][0].status // "pending"' <<<"$deployments")
             echo "Dokploy deployment status: $status"
             case "$status" in
               done) break ;;
