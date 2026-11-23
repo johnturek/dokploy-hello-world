@@ -1,4 +1,6 @@
 FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+LABEL org.opencontainers.image.source="https://github.com/johnturek/dokploy-hello-world"
+LABEL org.opencontainers.image.description="Secure Dokploy CI/CD reference application"
 WORKDIR /app
 ARG GIT_SHA=unknown
 COPY package.json ./

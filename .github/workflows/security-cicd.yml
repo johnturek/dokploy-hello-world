@@ -119,6 +119,9 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
           build-args: GIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/johnturek/dokploy-hello-world
+            org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
       - name: Make public deployment package readable by Dokploy
