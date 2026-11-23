@@ -1,0 +1,57 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+      - run: docker build --build-arg GIT_SHA=${{ github.sha }} -t dokploy-hello-world:${{ github.sha }} .
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger Dokploy deployment
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --retry 3 \
+            -X POST "$DOKPLOY_URL/api/application.deploy" \
+            -H 'content-type: application/json' \
+            -H "x-api-key: $DOKPLOY_API_KEY" \
+            --data "{\"applicationId\":\"$DOKPLOY_APPLICATION_ID\",\"title\":\"GitHub Actions ${GITHUB_SHA::7}\",\"description\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}"
+      - name: Verify production
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if body=$(curl --fail --silent --show-error https://hello.apps.azurefed.com/health 2>/dev/null) && echo "$body" | grep -q '"status":"ok"'; then
+              echo "Production is healthy: $body"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Production did not become healthy in time" >&2
+          exit 1
