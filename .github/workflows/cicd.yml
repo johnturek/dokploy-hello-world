@@ -31,27 +31,37 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Trigger Dokploy deployment
+      - name: Deploy and wait for Dokploy
         env:
           DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
           DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
           DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
         run: |
           set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           curl --fail-with-body --retry 3 \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \
             -H "x-api-key: $DOKPLOY_API_KEY" \
-            --data "{\"applicationId\":\"$DOKPLOY_APPLICATION_ID\",\"title\":\"GitHub Actions ${GITHUB_SHA::7}\",\"description\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}"
+            --data "{\"applicationId\":\"$DOKPLOY_APPLICATION_ID\",\"title\":\"GitHub Actions ${GITHUB_SHA::7}\",\"description\":\"$run_url\"}"
+
+          for attempt in $(seq 1 60); do
+            deployments=$(curl --fail --silent --show-error \
+              -H "x-api-key: $DOKPLOY_API_KEY" \
+              "$DOKPLOY_URL/api/deployment.all?applicationId=$DOKPLOY_APPLICATION_ID")
+            status=$(jq -r --arg run "$run_url" '[.[] | select(.description == $run)][0].status // "pending"' <<<"$deployments")
+            echo "Dokploy deployment status: $status"
+            case "$status" in
+              done) break ;;
+              error) echo "$deployments" | jq .; exit 1 ;;
+            esac
+            sleep 10
+          done
+          [ "$status" = done ] || { echo "Dokploy deployment timed out" >&2; exit 1; }
+
       - name: Verify production
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 60); do
-            if body=$(curl --fail --silent --show-error https://hello.apps.azurefed.com/health 2>/dev/null) && echo "$body" | grep -q '"status":"ok"'; then
-              echo "Production is healthy: $body"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "Production did not become healthy in time" >&2
-          exit 1
+          body=$(curl --fail --silent --show-error --retry 6 --retry-all-errors --retry-delay 5 https://hello.apps.azurefed.com/health)
+          echo "$body" | grep -q '"status":"ok"'
+          echo "Production is healthy: $body"
