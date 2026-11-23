@@ -1,0 +1,195 @@
+name: Secure CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: secure-production-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/johnturek/dokploy-hello-world
+
+jobs:
+  quality-gate:
+    name: Security quality gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v5
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@66f83c8206e0997178c8fd7bf1da9efccf5dd388 # v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install exact dependencies
+        run: npm ci
+      - name: Unit and integration tests
+        run: npm test
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@bcfb9cce635345aac9996cedc19b2de8e01b894f
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dockerfile lint
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+      - name: Build validation image
+        run: docker build --build-arg GIT_SHA=${{ github.sha }} -t dokploy-hello-world:ci .
+      - name: Scan image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@38b337fff0a2f984d5be173c99e3f633438167ec
+        with:
+          image-ref: dokploy-hello-world:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56
+        with:
+          image: dokploy-hello-world:ci
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom-${{ github.sha }}.cdx.json
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v5
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@38112626f97ac1fd7acf3df7ebca51f4677c1b38
+        with:
+          languages: javascript-typescript
+      - name: Set up Node.js
+        uses: actions/setup-node@66f83c8206e0997178c8fd7bf1da9efccf5dd388 # v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Analyze
+        uses: github/codeql-action/analyze@38112626f97ac1fd7acf3df7ebca51f4677c1b38
+
+  publish-deploy:
+    name: Sign and deploy immutable image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [quality-gate, codeql]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v5
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bf8388060db527dff14f48b6a5fdbe70763c1213
+      - name: Sign in to GHCR
+        uses: docker/login-action@d0b8297dd55199249f38268efae35fcb03f75aab
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish immutable image
+        id: build
+        uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          build-args: GIT_SHA=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Make public deployment package readable by Dokploy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PATCH /user/packages/container/dokploy-hello-world -f visibility=public
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@5f3ce9ff1d69aa1c61007ef696502bda98ddd677
+      - name: Sign and verify exact image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign verify \
+            --certificate-identity "https://github.com/johnturek/dokploy-hello-world/.github/workflows/security-cicd.yml@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE@$DIGEST"
+      - name: Deploy exact digest and wait for Dokploy
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_APPLICATION_ID: ${{ secrets.DOKPLOY_APPLICATION_ID }}
+        run: |
+          set -euo pipefail
+          image="$IMAGE@$DIGEST"
+          description="Image: $image; Commit: $GITHUB_SHA"
+
+          jq -n \
+            --arg applicationId "$DOKPLOY_APPLICATION_ID" \
+            --arg dockerImage "$image" \
+            '{applicationId: $applicationId, dockerImage: $dockerImage, username: "", password: "", registryUrl: ""}' \
+          | curl --fail-with-body --retry 3 \
+              -X POST "$DOKPLOY_URL/api/application.saveDockerProvider" \
+              -H 'content-type: application/json' \
+              -H "x-api-key: $DOKPLOY_API_KEY" \
+              --data-binary @-
+
+          jq -n \
+            --arg applicationId "$DOKPLOY_APPLICATION_ID" \
+            --arg title "Signed GHCR ${GITHUB_SHA::7}" \
+            --arg description "$description" \
+            '{applicationId: $applicationId, title: $title, description: $description}' \
+          | curl --fail-with-body --retry 3 \
+              -X POST "$DOKPLOY_URL/api/application.deploy" \
+              -H 'content-type: application/json' \
+              -H "x-api-key: $DOKPLOY_API_KEY" \
+              --data-binary @-
+
+          for attempt in $(seq 1 60); do
+            deployments=$(curl --fail --silent --show-error \
+              -H "x-api-key: $DOKPLOY_API_KEY" \
+              "$DOKPLOY_URL/api/deployment.all?applicationId=$DOKPLOY_APPLICATION_ID")
+            status=$(jq -r --arg description "$description" '[.[] | select(.description == $description)][0].status // "pending"' <<<"$deployments")
+            echo "Dokploy deployment status: $status"
+            case "$status" in
+              done) break ;;
+              error) echo "$deployments" | jq .; exit 1 ;;
+            esac
+            sleep 10
+          done
+          [ "$status" = done ] || { echo "Dokploy deployment timed out" >&2; exit 1; }
+      - name: Verify hardened production
+        run: |
+          set -euo pipefail
+          headers=$(mktemp)
+          body=$(curl --fail --silent --show-error --retry 6 --retry-all-errors --retry-delay 5 -D "$headers" https://hello.apps.azurefed.com/health)
+          echo "$body" | grep -q '"status":"ok"'
+          grep -qi '^strict-transport-security:' "$headers"
+          grep -qi '^content-security-policy:' "$headers"
+          page=$(curl --fail --silent --show-error https://hello.apps.azurefed.com/)
+          grep -q "$GITHUB_SHA" <<<"$page"
+          echo "Signed immutable production image is healthy"

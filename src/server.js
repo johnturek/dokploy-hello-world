@@ -1,5 +1,39 @@
 import http from "node:http";
 
+const requests = new Map();
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 120;
+
+function clientAddress(req) {
+  return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+}
+
+function securityHeaders(contentType) {
+  return {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests",
+    "cross-origin-opener-policy": "same-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    "referrer-policy": "no-referrer",
+    "strict-transport-security": "max-age=31536000; includeSubDomains",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY"
+  };
+}
+
+function rateLimited(req) {
+  const now = Date.now();
+  const address = clientAddress(req);
+  const current = requests.get(address);
+  if (!current || now - current.startedAt >= RATE_WINDOW_MS) {
+    requests.set(address, { startedAt: now, count: 1 });
+    return false;
+  }
+  current.count += 1;
+  return current.count > RATE_LIMIT;
+}
+
 export function message() {
   return "Hello from GitHub → Actions → Dokploy!";
 }
@@ -99,11 +133,15 @@ export function renderPage(commit = "local") {
 
 export function createServer() {
   return http.createServer((req, res) => {
+    if (rateLimited(req)) {
+      res.writeHead(429, { ...securityHeaders("application/json"), "retry-after": "60" });
+      return res.end(JSON.stringify({ error: "rate_limit_exceeded" }));
+    }
     if (req.url === "/health") {
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, securityHeaders("application/json"));
       return res.end(JSON.stringify({ status: "ok" }));
     }
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.writeHead(200, securityHeaders("text/html; charset=utf-8"));
     res.end(renderPage(process.env.GIT_SHA ?? "local"));
   });
 }

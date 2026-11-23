@@ -17,17 +17,20 @@ test("health endpoint", async () => {
   await new Promise(resolve => server.once("listening", resolve));
   try {
     const { port } = server.address();
-    const { status, body } = await new Promise((resolve, reject) => {
+    const { status, headers, body } = await new Promise((resolve, reject) => {
       const request = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, response => {
         let body = "";
         response.setEncoding("utf8");
         response.on("data", chunk => { body += chunk; });
-        response.on("end", () => resolve({ status: response.statusCode, body }));
+        response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, body }));
       });
       request.on("error", reject);
     });
     assert.equal(status, 200);
     assert.deepEqual(JSON.parse(body), { status: "ok" });
+    assert.equal(headers["x-content-type-options"], "nosniff");
+    assert.equal(headers["x-frame-options"], "DENY");
+    assert.match(headers["content-security-policy"], /frame-ancestors 'none'/);
   } finally {
     const closed = new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     server.closeAllConnections();
