@@ -39,6 +39,19 @@ jobs:
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Dokploy performs the production image build, so pass this workflow's
+          # exact commit into that build—not only into the CI validation image.
+          jq -n \
+            --arg applicationId "$DOKPLOY_APPLICATION_ID" \
+            --arg buildArgs "GIT_SHA=$GITHUB_SHA" \
+            '{applicationId: $applicationId, env: "", buildArgs: $buildArgs, buildSecrets: "", createEnvFile: true}' \
+          | curl --fail-with-body --retry 3 \
+              -X POST "$DOKPLOY_URL/api/application.saveEnvironment" \
+              -H 'content-type: application/json' \
+              -H "x-api-key: $DOKPLOY_API_KEY" \
+              --data-binary @-
+
           curl --fail-with-body --retry 3 \
             -X POST "$DOKPLOY_URL/api/application.deploy" \
             -H 'content-type: application/json' \
