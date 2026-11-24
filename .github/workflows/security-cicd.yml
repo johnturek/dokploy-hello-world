@@ -124,10 +124,6 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
-      - name: Make public deployment package readable by Dokploy
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api --method PATCH /user/packages/container/dokploy-hello-world -f visibility=public
       - name: Install Cosign
         uses: sigstore/cosign-installer@5f3ce9ff1d69aa1c61007ef696502bda98ddd677
       - name: Sign and verify exact image digest
